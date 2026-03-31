@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 训练输出（大文件/结果，不需要跨机器同步）
+line_track/output/
+
+# acmpc_public 中不需要同步的内容
+acmpc_public/img/
+acmpc_public/LICENSE
+acmpc_public/README.md
+
+# 模型权重
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.h5
+*.npz
+
+# IDE
+.idea/
+.vscode/
+
+# 其他
+*.log
+.DS_Store
