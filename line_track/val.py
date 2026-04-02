@@ -66,7 +66,12 @@ class TrajectoryAnalyzer:
             "vel": np.zeros((max_steps, 3)),
             "vel_ref": np.zeros((max_steps, 3)),
             "quat": np.zeros((max_steps, 4)),
-            "action": np.zeros((max_steps, 4)),  # [f_c, wx, wy, wz]
+            # Policy action before env-side remapping:
+            # [normalized thrust delta, wx, wy, wz]
+            "action_policy": np.zeros((max_steps, 4)),
+            # Physical action sent into dynamics by env:
+            # [f_c, wx, wy, wz]
+            "action_physical": np.zeros((max_steps, 4)),
             "pos_error": np.zeros(max_steps),
             "vel_error": np.zeros(max_steps),
             "reward": np.zeros(max_steps),
@@ -75,15 +80,16 @@ class TrajectoryAnalyzer:
         while not done and step < max_steps:
             # Get action from policy
             action, _states = model.predict(obs, deterministic=deterministic)
+            ref = env.get_reference(step)
 
             # Record pre-step state
             traj["t"][step] = step * env.dt
             traj["pos"][step] = obs[:3]
             traj["quat"][step] = obs[3:7]
             traj["vel"][step] = obs[7:10]
-            traj["pos_ref"][step] = info.get("target_pos", np.zeros(3))
-            traj["vel_ref"][step] = np.array([-env.target_speed, 0.0, 0.0])
-            traj["action"][step] = action
+            traj["pos_ref"][step] = ref["position"]
+            traj["vel_ref"][step] = ref["velocity"]
+            traj["action_policy"][step] = action
 
             # Step environment
             obs, reward, terminated, truncated, info = env.step(action)
@@ -92,6 +98,7 @@ class TrajectoryAnalyzer:
             # Record error metrics
             traj["pos_error"][step] = info.get("pos_error", 0.0)
             traj["vel_error"][step] = info.get("vel_error", 0.0)
+            traj["action_physical"][step] = info.get("action_physical", np.zeros(4))
             traj["reward"][step] = float(reward)
 
             step += 1
@@ -118,14 +125,14 @@ class TrajectoryAnalyzer:
         }
 
         # Thrust statistics
-        thrust = traj["action"][:, 0]
+        thrust = traj["action_physical"][:, 0]
         stats["thrust_mean"] = float(np.mean(thrust))
         stats["thrust_max"] = float(np.max(thrust))
         stats["thrust_min"] = float(np.min(thrust))
 
         # Angular velocity statistics
         for i, name in enumerate(["wx", "wy", "wz"]):
-            omega = traj["action"][:, i + 1]
+            omega = traj["action_physical"][:, i + 1]
             stats[f"{name}_mean"] = float(np.mean(np.abs(omega)))
             stats[f"{name}_max"] = float(np.max(np.abs(omega)))
 
@@ -204,7 +211,7 @@ class TrajectoryAnalyzer:
         ax.grid(True, alpha=0.3)
 
         ax = fig.add_subplot(gs[2, 1])
-        ax.plot(traj["t"], traj["action"][:, 0], "g-", linewidth=2)
+        ax.plot(traj["t"], traj["action_physical"][:, 0], "g-", linewidth=2)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Control (N)")
         ax.set_title(f"Thrust Command\nMean: {stats['thrust_mean']:.2f}N, Max: {stats['thrust_max']:.2f}N")
@@ -214,9 +221,9 @@ class TrajectoryAnalyzer:
 
         # 5. Angular velocities
         ax = fig.add_subplot(gs[2, 2])
-        ax.plot(traj["t"], traj["action"][:, 1], "r-", linewidth=1.5, label="wx")
-        ax.plot(traj["t"], traj["action"][:, 2], "g-", linewidth=1.5, label="wy")
-        ax.plot(traj["t"], traj["action"][:, 3], "b-", linewidth=1.5, label="wz")
+        ax.plot(traj["t"], traj["action_physical"][:, 1], "r-", linewidth=1.5, label="wx")
+        ax.plot(traj["t"], traj["action_physical"][:, 2], "g-", linewidth=1.5, label="wy")
+        ax.plot(traj["t"], traj["action_physical"][:, 3], "b-", linewidth=1.5, label="wz")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Angular Velocity (rad/s)")
         ax.set_title("Body Angular Velocities")
@@ -336,21 +343,50 @@ def main():
     print(f"Policy mode:        {metadata['policy_mode']}")
     print(f"Training timesteps: {metadata['total_timesteps']}")
     print(f"Validation episodes: {args.n_episodes}")
-    print(f"Device:             {metadata['device']}")
+    #print(f"Device:             {metadata['device']}")
     print(f"{'='*80}\n")
 
-    # Load model
+    # MPC policy class expects ACMPC_T to be present (set during training).
+    if metadata.get("policy_mode", "") == "mpc":
+        os.environ.setdefault("ACMPC_T", "2")
+
+    # Load model from stable-baselines3 archive.
+    model_path = model_dir / "policy.zip"
+    if not model_path.exists():
+        model_path = model_dir / "policy"
+
     try:
-        policy_class = metadata.get("policy_mode", "mpc")
-        model = PPO.load(model_dir / "policy")
-        print(f"✓ Loaded model from: {model_dir / 'policy'}\n")
+        model = PPO.load(model_path)
+        print(f"✓ Loaded model from: {model_path}\n")
     except Exception as e:
         print(f"✗ Failed to load model: {e}")
+        if isinstance(e, KeyError) and "ACMPC_T" in str(e):
+            print("Hint: set ACMPC_T before validation, e.g. set ACMPC_T=2")
         sys.exit(1)
 
-    # Set up environment
+    # Set up environment (match training metadata to avoid train/val task mismatch)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = RealDroneLineTrackEnv(device=str(device))
+    max_episode_steps = int(metadata.get("max_episode_steps", 250))
+    target_distance = float(metadata.get("target_distance", 5.0))
+    start_state = metadata.get("start_state")
+    goal_state = metadata.get("goal_state")
+    start_state_np = np.asarray(start_state, dtype=np.float32).reshape(10) if start_state is not None else None
+    goal_state_np = np.asarray(goal_state, dtype=np.float32).reshape(10) if goal_state is not None else None
+
+    env = RealDroneLineTrackEnv(
+        max_steps=max_episode_steps,
+        target_distance=target_distance,
+        start_state=start_state_np,
+        goal_state=goal_state_np,
+        device=str(device),
+    )
+
+    print(
+        "Validation env: "
+        f"max_steps={env.max_steps}, "
+        f"target_distance={env.target_distance:.3f}, "
+        f"dt={env.dt:.3f}s"
+    )
 
     # Create output directory for validation results
     results_dir = model_dir / "validation"

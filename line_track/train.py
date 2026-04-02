@@ -16,6 +16,10 @@ Policy modes:
 
 import os
 import sys
+import subprocess
+import multiprocessing as mp
+import warnings
+from typing import Dict, Optional
 from pathlib import Path
 from datetime import datetime
 
@@ -28,11 +32,44 @@ from gym import spaces
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+
+# Suppress known third-party warning from mpc package (torch.uint8 mask deprecation).
+warnings.filterwarnings(
+    "ignore",
+    message=r"indexing with dtype torch\.uint8 is now deprecated, please use a dtype torch\.bool instead\.",
+    category=UserWarning,
+    module=r"mpc\.util",
+)
 
 # Import your policy classes
 from acmpc_public.training_modules.mlp_only_policy import MlpOnlyPolicy
 from acmpc_public.training_modules.mlp_mpc_policy import MlpMpcPolicy
 from acmpc_public.diff_mpc_drones import drone
+
+
+# Editable in-code defaults. Environment variables with the same names still override these values.
+DEFAULT_CONFIG = {
+    "POLICY_MODE": "mlp",
+    "TOTAL_TIMESTEPS": 2000000,
+    "N_ENVS": None,  # auto-computed when None
+    "N_STEPS": 256,
+    "BATCH_SIZE": 256,
+    "N_EPOCHS": 8,
+    "LEARNING_RATE": 0.01,
+    "VEC_MODE": "subproc",  # subproc | dummy
+    "ENV_DEVICE": "cpu",
+    "MAX_EPISODE_STEPS": 1000,  # 5s horizon at dt=0.02 for the line-track task
+}
+
+
+def _get_cfg(name: str, default_value, cast_fn):
+    """Read value from env var first, then fallback to in-code default."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default_value
+    return cast_fn(raw)
 
 
 class EpisodeStatsCallback(BaseCallback):
@@ -43,8 +80,41 @@ class EpisodeStatsCallback(BaseCallback):
         self.episode_count = 0
         self.best_reward = -np.inf
         self.best_episode = 0
+        self.best_done_reason = "unknown"
+        self.best_final_position = np.full(3, np.nan, dtype=np.float32)
         self._episode_returns = None
         self._episode_steps = None
+
+    @staticmethod
+    def _read_gpu_utilization() -> str:
+        """Read GPU utilization percentage for runtime visibility."""
+        if not torch.cuda.is_available():
+            return "N/A(CPU)"
+
+        # Prefer direct torch API when available.
+        if hasattr(torch.cuda, "utilization"):
+            try:
+                util = float(torch.cuda.utilization(0))
+                return f"{util:.1f}%"
+            except Exception:
+                pass
+
+        # Fallback to nvidia-smi.
+        try:
+            output = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+            first_line = output.decode("utf-8", errors="ignore").strip().splitlines()[0]
+            util = float(first_line)
+            return f"{util:.1f}%"
+        except Exception:
+            return "N/A(unavailable)"
 
     def _on_step(self) -> bool:
         rewards = np.asarray(self.locals.get("rewards", []), dtype=np.float32)
@@ -58,8 +128,16 @@ class EpisodeStatsCallback(BaseCallback):
             self._episode_returns = np.zeros_like(rewards, dtype=np.float32)
             self._episode_steps = np.zeros_like(rewards, dtype=np.int32)
 
+        assert self._episode_returns is not None
+        assert self._episode_steps is not None
+
         self._episode_returns += rewards
         self._episode_steps += 1
+
+        ended_rewards = []
+        ended_reasons = []
+        ended_steps = []
+        ended_positions = []
 
         for idx, done in enumerate(dones):
             if not done:
@@ -75,36 +153,158 @@ class EpisodeStatsCallback(BaseCallback):
             pos = np.asarray(position, dtype=np.float32).reshape(-1)
             if pos.size < 3:
                 pos = np.pad(pos, (0, 3 - pos.size), mode="constant", constant_values=np.nan)
-            pos_str = f"[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]"
+
+            ended_rewards.append(last_reward)
+            ended_reasons.append(done_reason)
+            ended_steps.append(last_steps)
+            ended_positions.append(pos)
 
             if last_reward > self.best_reward:
                 self.best_reward = last_reward
                 self.best_episode = self.episode_count
-
-            sep = "=" * 80
-            print(f"\n{sep}")
-            print(f"episode      : {self.episode_count}")
-            print(f"last_reward  : {last_reward:.4f}")
-            print(f"done_reason  : {done_reason}")
-            print(f"last_steps   : {last_steps}")
-            print(f"final_pos    : {pos_str}")
-            print(f"best_reward  : {self.best_reward:.4f} (episode {self.best_episode})")
-            print(sep)
+                self.best_done_reason = done_reason
+                self.best_final_position = pos.copy()
 
             self._episode_returns[idx] = 0.0
             self._episode_steps[idx] = 0
 
+        if ended_rewards:
+            ended_rewards_np = np.asarray(ended_rewards, dtype=np.float32)
+            ended_steps_np = np.asarray(ended_steps, dtype=np.int32)
+
+            round_avg_reward = float(np.mean(ended_rewards_np))
+            round_best_idx = int(np.argmax(ended_rewards_np))
+            round_best_reward = float(ended_rewards_np[round_best_idx])
+            round_reason = ended_reasons[round_best_idx]
+            round_steps = int(ended_steps_np[round_best_idx])
+            round_pos = ended_positions[round_best_idx]
+            gpu_util = self._read_gpu_utilization()
+
+            sep = "=" * 80
+            print(f"\n{sep}")
+            print(f"episode                     : {self.episode_count}")
+            print(f"last_round_avg_reward       : {round_avg_reward:.4f}")
+            print(f"last_round_best_reward      : {round_best_reward:.4f}")
+            print(f"last_round_done_reason      : {round_reason}")
+            print(f"last_round_done_steps       : {round_steps}")
+            print(f"last_round_final_pos        : [{round_pos[0]:.3f}, {round_pos[1]:.3f}, {round_pos[2]:.3f}]")
+            print(f"global_best_reward          : {self.best_reward:.4f} (episode {self.best_episode})")
+
+            print(f"gpu_utilization             : {gpu_util}")
+            print(sep)
+
         return True
+
+
+def _choose_batch_size(rollout_size: int, preferred_batch: int) -> int:
+    """Choose a PPO minibatch size that divides rollout_size."""
+    candidate = max(1, min(preferred_batch, rollout_size))
+    while rollout_size % candidate != 0 and candidate > 1:
+        candidate -= 1
+    return max(1, candidate)
+
+
+def _normalize_quaternion(quat: np.ndarray) -> np.ndarray:
+    """Return a unit quaternion, falling back to identity if needed."""
+    quat = np.asarray(quat, dtype=np.float32).reshape(4)
+    norm = float(np.linalg.norm(quat))
+    if norm < 1e-8:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return quat / norm
+
+
+def plan_straight_t_profile_trajectory(
+    start_state: np.ndarray,
+    goal_state: np.ndarray,
+    max_steps: int,
+    dt: float,
+    accel_fraction: float = 0.25,
+    decel_fraction: float = 0.25,
+) -> Dict[str, np.ndarray]:
+    """
+    Plan a straight-line rest-to-rest trajectory with a T-shaped speed profile.
+
+    The planner uses the position and attitude components from the provided states.
+    Velocity references are generated internally so the trajectory starts and ends at rest.
+    """
+    start_state = np.asarray(start_state, dtype=np.float32).reshape(10)
+    goal_state = np.asarray(goal_state, dtype=np.float32).reshape(10)
+
+    total_time = max(float(max_steps) * float(dt), float(dt))
+    accel_fraction = float(np.clip(accel_fraction, 1e-3, 0.499))
+    decel_fraction = float(np.clip(decel_fraction, 1e-3, 0.499))
+    cruise_fraction = 1.0 - accel_fraction - decel_fraction
+    if cruise_fraction < 0.0:
+        accel_fraction = 0.5
+        decel_fraction = 0.5
+        cruise_fraction = 0.0
+
+    accel_time = total_time * accel_fraction
+    decel_time = total_time * decel_fraction
+    cruise_time = total_time * cruise_fraction
+
+    times = np.arange(max_steps + 1, dtype=np.float32) * float(dt)
+    start_pos = start_state[0:3]
+    goal_pos = goal_state[0:3]
+    delta_pos = goal_pos - start_pos
+    distance = float(np.linalg.norm(delta_pos))
+
+    start_quat = _normalize_quaternion(start_state[3:7])
+    goal_quat = _normalize_quaternion(goal_state[3:7])
+
+    positions = np.zeros((max_steps + 1, 3), dtype=np.float32)
+    quaternions = np.zeros((max_steps + 1, 4), dtype=np.float32)
+    velocities = np.zeros((max_steps + 1, 3), dtype=np.float32)
+
+    if distance < 1e-6:
+        positions[:] = start_pos
+        velocities[:] = 0.0
+    else:
+        direction = delta_pos / distance
+        denom = max(accel_time * (accel_time + cruise_time), 1e-6)
+        accel = distance / denom
+        vmax = accel * accel_time
+
+        for idx, t in enumerate(times):
+            clamped_t = min(float(t), total_time)
+            if clamped_t <= accel_time:
+                scalar_pos = 0.5 * accel * clamped_t * clamped_t
+                scalar_vel = accel * clamped_t
+            elif clamped_t <= accel_time + cruise_time:
+                scalar_pos = 0.5 * accel * accel_time * accel_time + vmax * (clamped_t - accel_time)
+                scalar_vel = vmax
+            else:
+                remaining = max(total_time - clamped_t, 0.0)
+                scalar_pos = distance - 0.5 * accel * remaining * remaining
+                scalar_vel = accel * remaining
+
+            positions[idx] = start_pos + direction * scalar_pos
+            velocities[idx] = direction * scalar_vel
+
+    blend = np.linspace(0.0, 1.0, max_steps + 1, dtype=np.float32)
+    for idx, alpha in enumerate(blend):
+        quaternions[idx] = _normalize_quaternion((1.0 - alpha) * start_quat + alpha * goal_quat)
+
+    positions[-1] = goal_pos
+    velocities[-1] = np.zeros(3, dtype=np.float32)
+    quaternions[-1] = goal_quat
+
+    states = np.concatenate([positions, quaternions, velocities], axis=1).astype(np.float32)
+    return {
+        "time": times,
+        "position": positions,
+        "velocity": velocities,
+        "quaternion": quaternions,
+        "state": states,
+    }
 
 
 class RealDroneLineTrackEnv(gym.Env):
     """
     Real drone dynamics environment for line tracking task.
-    
-    Task: Track a reference trajectory moving at constant velocity along -X axis.
-    - Start position: (0, 0, 0)
-    - Target position: (-5, 0, 0) after 5 seconds
-    - Reference velocity: 1.0 m/s along -X axis
+
+    Task: Fly from a start hover state to a goal hover state using a straight-line
+    T-profile reference trajectory.
     
     State & Control:
     - state x: [p(3), q(4), v(3)]  -- position, quaternion, velocity (10-dim)
@@ -119,15 +319,34 @@ class RealDroneLineTrackEnv(gym.Env):
         max_steps: int = 250,  # 5s at dt=0.02s
         dt: float = 0.02,
         target_distance: float = 5.0,  # meters
-        target_speed: float = 1.0,  # m/s
+        start_state: Optional[np.ndarray] = None,
+        goal_state: Optional[np.ndarray] = None,
         device: str = 'cpu'
     ):
         super().__init__()
         self.max_steps = max_steps
         self.dt = dt
         self.target_distance = target_distance
-        self.target_speed = target_speed
         self.device = torch.device(device)
+
+        default_start_state = np.array([
+            0.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0,
+        ], dtype=np.float32)
+        default_goal_state = np.array([
+            -target_distance, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0,
+        ], dtype=np.float32)
+        self.start_state_np = np.asarray(
+            default_start_state if start_state is None else start_state,
+            dtype=np.float32,
+        ).reshape(10)
+        self.goal_state_np = np.asarray(
+            default_goal_state if goal_state is None else goal_state,
+            dtype=np.float32,
+        ).reshape(10)
 
         # Real drone dynamics (torch-native)
         self.dx = drone.DroneDx(device=str(device))
@@ -140,16 +359,28 @@ class RealDroneLineTrackEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Action: thrust, body angular velocities (4-dim, real physical units)
+        # Action re-parameterization:
+        # - a[0] in [-1, 1] is normalized thrust delta around hover thrust.
+        # - a[1:4] are body angular velocities in physical units.
+        # This makes initial policy output (near zero) correspond to near-hover control.
+        self.hover_thrust = float(-self.dx.g[2].item() * self.dx.mass)
+        self.thrust_phys_low = float(self.dx.thrust_min * 4)
+        self.thrust_phys_high = float(self.dx.thrust_max * 4)
+        self.thrust_delta_limit = float(min(
+            self.hover_thrust - self.thrust_phys_low,
+            self.thrust_phys_high - self.hover_thrust,
+        ))
+
+        # Action: [normalized thrust delta, wx, wy, wz]
         self.action_space = spaces.Box(
             low=np.array([
-                float(self.dx.thrust_min * 4),
+                -1.0,
                 float(-self.dx.omega_max[0]),
                 float(-self.dx.omega_max[1]),
                 float(-self.dx.omega_max[2]),
             ], dtype=np.float32),
             high=np.array([
-                float(self.dx.thrust_max * 4),
+                1.0,
                 float(self.dx.omega_max[0]),
                 float(self.dx.omega_max[1]),
                 float(self.dx.omega_max[2]),
@@ -157,57 +388,120 @@ class RealDroneLineTrackEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Cache action bounds as torch tensors — avoids re-creating them every step
+        # Policy-side bounds (for clipping incoming actions)
         self.u_low = torch.tensor(
-            [float(self.dx.thrust_min * 4),
+            [-1.0,
              float(-self.dx.omega_max[0]),
              float(-self.dx.omega_max[1]),
              float(-self.dx.omega_max[2])],
             dtype=torch.float32, device=self.device)
         self.u_high = torch.tensor(
-            [float(self.dx.thrust_max * 4),
+            [1.0,
              float(self.dx.omega_max[0]),
              float(self.dx.omega_max[1]),
              float(self.dx.omega_max[2])],
             dtype=torch.float32, device=self.device)
 
-        # Reference velocity tensor (constant for line-track task)
-        self.target_vel = torch.tensor(
-            [-self.target_speed, 0.0, 0.0],
+        # Physical control bounds for dynamics input u=[fc, wx, wy, wz]
+        self.u_phys_low = torch.tensor(
+            [self.thrust_phys_low,
+             float(-self.dx.omega_max[0]),
+             float(-self.dx.omega_max[1]),
+             float(-self.dx.omega_max[2])],
             dtype=torch.float32, device=self.device)
+        self.u_phys_high = torch.tensor(
+            [self.thrust_phys_high,
+             float(self.dx.omega_max[0]),
+             float(self.dx.omega_max[1]),
+             float(self.dx.omega_max[2])],
+            dtype=torch.float32, device=self.device)
+
+        trajectory = plan_straight_t_profile_trajectory(
+            start_state=self.start_state_np,
+            goal_state=self.goal_state_np,
+            max_steps=self.max_steps,
+            dt=self.dt,
+        )
+        self.reference_state = torch.as_tensor(trajectory["state"], dtype=torch.float32, device=self.device)
+        self.reference_pos = torch.as_tensor(trajectory["position"], dtype=torch.float32, device=self.device)
+        self.reference_vel = torch.as_tensor(trajectory["velocity"], dtype=torch.float32, device=self.device)
+        self.reference_quat = torch.as_tensor(trajectory["quaternion"], dtype=torch.float32, device=self.device)
 
         # Internal state: torch tensor for efficient computation
         self.state = None  # torch.Tensor [10]
         self.step_count = 0
 
-    def _target_position(self, step: int) -> torch.Tensor:
-        """Reference position at timestep k: linearly moving along -X."""
-        x = -self.target_distance * min(step * self.dt / (self.max_steps * self.dt), 1.0)
-        return torch.tensor([x, 0.0, 0.0], dtype=torch.float32, device=self.device)
+    def _reference_index(self, step: int) -> int:
+        return int(np.clip(step, 0, self.max_steps))
+
+    def _reference_at(self, step: int):
+        idx = self._reference_index(step)
+        return self.reference_state[idx], self.reference_pos[idx], self.reference_vel[idx], self.reference_quat[idx]
+
+    def get_reference(self, step: int) -> Dict[str, np.ndarray]:
+        idx = self._reference_index(step)
+        return {
+            "state": self.reference_state[idx].detach().cpu().numpy().copy(),
+            "position": self.reference_pos[idx].detach().cpu().numpy().copy(),
+            "velocity": self.reference_vel[idx].detach().cpu().numpy().copy(),
+            "quaternion": self.reference_quat[idx].detach().cpu().numpy().copy(),
+        }
 
     def _get_obs(self) -> np.ndarray:
         """Convert internal torch tensor to numpy for gym interface."""
+        assert self.state is not None
         return self.state.cpu().numpy().astype(np.float32)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.step_count = 0
 
-        # Initial state: at origin, identity quaternion, stationary
-        # Store as torch tensor on device for efficient computation
-        self.state = torch.tensor([
-            0.0, 0.0, 0.0,           # position
-            1.0, 0.0, 0.0, 0.0,      # quaternion (identity)
-            0.0, 0.0, 0.0,           # velocity
-        ], dtype=torch.float32, device=self.device)
+        if options is not None:
+            start_state = options.get("start_state")
+            goal_state = options.get("goal_state")
+            if start_state is not None or goal_state is not None:
+                self.start_state_np = np.asarray(
+                    self.start_state_np if start_state is None else start_state,
+                    dtype=np.float32,
+                ).reshape(10)
+                self.goal_state_np = np.asarray(
+                    self.goal_state_np if goal_state is None else goal_state,
+                    dtype=np.float32,
+                ).reshape(10)
+                trajectory = plan_straight_t_profile_trajectory(
+                    start_state=self.start_state_np,
+                    goal_state=self.goal_state_np,
+                    max_steps=self.max_steps,
+                    dt=self.dt,
+                )
+                self.reference_state = torch.as_tensor(trajectory["state"], dtype=torch.float32, device=self.device)
+                self.reference_pos = torch.as_tensor(trajectory["position"], dtype=torch.float32, device=self.device)
+                self.reference_vel = torch.as_tensor(trajectory["velocity"], dtype=torch.float32, device=self.device)
+                self.reference_quat = torch.as_tensor(trajectory["quaternion"], dtype=torch.float32, device=self.device)
 
-        return self._get_obs(), {}
+        self.state = torch.as_tensor(self.start_state_np, dtype=torch.float32, device=self.device).clone()
+
+        ref = self.get_reference(step=0)
+        info = {
+            "target_pos": ref["position"],
+            "target_vel": ref["velocity"],
+            "target_quat": ref["quaternion"],
+        }
+
+        return self._get_obs(), info
 
     def step(self, action):
-        # Convert incoming action (numpy from SB3) to torch immediately
-        u = torch.as_tensor(action, dtype=torch.float32, device=self.device)
-        # Clip to physical bounds (torch, no numpy involved)
-        u = u.clamp(self.u_low, self.u_high)
+        assert self.state is not None
+
+        # Convert incoming action (numpy from SB3) to torch immediately.
+        # a[0] is normalized thrust delta, mapped to physical thrust around hover.
+        a = torch.as_tensor(action, dtype=torch.float32, device=self.device)
+        a = a.clamp(self.u_low, self.u_high)
+
+        thrust_delta_norm = a[0]
+        thrust_cmd = self.hover_thrust + thrust_delta_norm * self.thrust_delta_limit
+        u = torch.cat([thrust_cmd.unsqueeze(0), a[1:4]])
+        u = u.clamp(self.u_phys_low, self.u_phys_high)
 
         # Advance dynamics: fully torch, no numpy conversion
         with torch.no_grad():
@@ -221,17 +515,19 @@ class RealDroneLineTrackEnv(gym.Env):
         vel = self.state[7:10]
 
         # Reference trajectory (torch tensors on device)
-        target_pos = self._target_position(self.step_count)
+        _, target_pos, target_vel, target_quat = self._reference_at(self.step_count)
 
         # Reward: all torch arithmetic, scalar via .item()
         pos_error = (pos - target_pos).norm()
-        vel_error = (vel - self.target_vel).norm()
-        q_error = 1.0 - quat[0].abs()          # prefer identity quaternion
-        control_cost = 0.01 * u.norm()
-        reward = 1.0 - 3.0 * pos_error - 0.5 * vel_error - 0.3 * q_error - control_cost
+        vel_error = (vel - target_vel).norm()
+        q_error = 1.0 - torch.abs(torch.dot(quat, target_quat))
+        # Penalize control effort relative to hover, not absolute thrust.
+        control_vec = torch.cat([thrust_delta_norm.unsqueeze(0), a[1:4] / self.u_high[1:4]])
+        control_cost = 0.01 * control_vec.norm()
+        reward = 5.0 - 3.0 * pos_error - control_cost
 
         # Terminal conditions (scalar bool)
-        terminated = bool(pos.norm().item() > 10.0)
+        terminated = bool(pos.norm().item() > 15.0)
         truncated = self.step_count >= self.max_steps
 
         # Convert to numpy only at the gym boundary (info dict consumed externally)
@@ -239,11 +535,16 @@ class RealDroneLineTrackEnv(gym.Env):
         info = {
             "position": pos_np.copy(),
             "target_pos": target_pos.cpu().numpy().copy(),
+            "target_vel": target_vel.cpu().numpy().copy(),
+            "target_quat": target_quat.cpu().numpy().copy(),
             "pos_error": pos_error.item(),
             "vel_error": vel_error.item(),
+            "quat_error": q_error.item(),
             "velocity": vel.cpu().numpy().copy(),
             "quaternion": quat.cpu().numpy().copy(),
-            "action": u.cpu().numpy().copy(),
+            "action_raw": a.cpu().numpy().copy(),
+            "action_physical": u.cpu().numpy().copy(),
+            "hover_thrust": self.hover_thrust,
         }
 
         if terminated:
@@ -279,23 +580,61 @@ def print_torch_runtime_info() -> None:
 def main():
     print_torch_runtime_info()
 
-    # Configuration from environment variables or defaults
-    policy_mode = os.getenv("POLICY_MODE", "mpc").lower()
-    total_timesteps = int(os.getenv("TOTAL_TIMESTEPS", "100000"))
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Configuration from in-code defaults with optional env-var override.
+    policy_mode = _get_cfg("POLICY_MODE", DEFAULT_CONFIG["POLICY_MODE"], str).lower()
+    total_timesteps = _get_cfg("TOTAL_TIMESTEPS", DEFAULT_CONFIG["TOTAL_TIMESTEPS"], int)
+    model_device = "cuda" if torch.cuda.is_available() else "cpu"
+    default_n_envs = max(1, min(8, mp.cpu_count() // 2 if mp.cpu_count() > 1 else 1))
+    n_envs_default = default_n_envs if DEFAULT_CONFIG["N_ENVS"] is None else int(DEFAULT_CONFIG["N_ENVS"])
+    n_envs = _get_cfg("N_ENVS", n_envs_default, int)
+    n_steps = _get_cfg("N_STEPS", DEFAULT_CONFIG["N_STEPS"], int)
+    max_episode_steps = _get_cfg("MAX_EPISODE_STEPS", DEFAULT_CONFIG["MAX_EPISODE_STEPS"], int)
+    preferred_batch_size = _get_cfg("BATCH_SIZE", DEFAULT_CONFIG["BATCH_SIZE"], int)
+    n_epochs = _get_cfg("N_EPOCHS", DEFAULT_CONFIG["N_EPOCHS"], int)
+    learning_rate = _get_cfg("LEARNING_RATE", DEFAULT_CONFIG["LEARNING_RATE"], float)
+    vec_mode = _get_cfg("VEC_MODE", DEFAULT_CONFIG["VEC_MODE"], str).lower()  # subproc | dummy
+    env_device = _get_cfg("ENV_DEVICE", DEFAULT_CONFIG["ENV_DEVICE"], str).lower()
+
+    if vec_mode not in {"subproc", "dummy"}:
+        raise ValueError("VEC_MODE must be 'subproc' or 'dummy'")
+
+    if n_envs <= 1:
+        vec_mode = "dummy"
+
+    # 多进程 + CUDA 环境通常会导致显存与上下文开销异常，这里默认转回 CPU 环境。
+    if vec_mode == "subproc" and env_device == "cuda":
+        print("[WARNING] ENV_DEVICE=cuda with VEC_MODE=subproc is not recommended; force ENV_DEVICE=cpu")
+        env_device = "cpu"
 
     # For MPC policy, set prediction horizon
     if policy_mode == "mpc":
-        os.environ.setdefault("ACMPC_T", "5")
+        os.environ.setdefault("ACMPC_T", "2")
+
+    rollout_size = n_steps * n_envs
+    batch_size = _choose_batch_size(rollout_size=rollout_size, preferred_batch=preferred_batch_size)
+    minibatches_per_epoch = rollout_size // batch_size
+    updates_per_episode_est = float(max_episode_steps) / float(n_steps)
+    minibatches_per_episode_est = updates_per_episode_est * minibatches_per_epoch * n_epochs
 
     print(f"\n{'='*80}")
     print(f"Training Configuration")
     print(f"{'='*80}")
     print(f"Policy Mode       : {policy_mode}")
     print(f"Total Timesteps   : {total_timesteps}")
-    print(f"Device            : {device}")
+    print(f"Model Device      : {model_device}")
+    print(f"Env Device        : {env_device}")
+    print(f"Vec Mode          : {vec_mode}")
+    print(f"N Env             : {n_envs}")
+    print(f"N Steps           : {n_steps}")
+    print(f"Max Episode Steps : {max_episode_steps}")
+    print(f"Rollout Size      : {rollout_size}")
+    print(f"Batch Size        : {batch_size}")
+    print(f"N Epochs          : {n_epochs}")
+    print(f"Learning Rate     : {learning_rate}")
+    print(f"MiniBatch/Epoch   : {minibatches_per_epoch}")
+    print(f"Est Batch/Episode : {minibatches_per_episode_est:.2f}")
     if policy_mode == "mpc":
-        print(f"MPC Horizon (T)   : {os.environ.get('ACMPC_T', '5')}")
+        print(f"MPC Horizon (T)   : {os.environ.get('ACMPC_T', '2')}")
     print(f"{'='*80}\n")
 
     # Policy registry
@@ -307,8 +646,15 @@ def main():
     if policy_mode not in policy_registry:
         raise ValueError(f"Unsupported POLICY_MODE: {policy_mode}. Choose from {list(policy_registry.keys())}")
 
-    # Create environment and policy
-    env = RealDroneLineTrackEnv(device=device)
+    # Create vectorized environment and policy
+    vec_env_cls = SubprocVecEnv if vec_mode == "subproc" else DummyVecEnv
+    env = make_vec_env(
+        RealDroneLineTrackEnv,
+        n_envs=n_envs,
+        seed=0,
+        env_kwargs={"device": env_device, "max_steps": max_episode_steps},
+        vec_env_cls=vec_env_cls,
+    )
     policy_class = policy_registry[policy_mode]
 
     # Create PPO model
@@ -316,16 +662,32 @@ def main():
         policy=policy_class,
         env=env,
         verbose=0,
-        n_steps=1024,
-        batch_size=128,
-        learning_rate=3e-4,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        learning_rate=learning_rate,
         gamma=0.99,
         clip_range=0.2,
+        device=model_device,
     )
 
     # Train
     print(f"Starting training for {total_timesteps} timesteps...\n")
-    model.learn(total_timesteps=total_timesteps, callback=EpisodeStatsCallback())
+    episode_stats_callback = EpisodeStatsCallback()
+    model.learn(total_timesteps=total_timesteps, callback=episode_stats_callback)
+
+    best_pos = episode_stats_callback.best_final_position
+    print(f"\n{'='*80}")
+    print("Final Best Episode Summary")
+    print(f"{'='*80}")
+    print(f"best_reward                : {episode_stats_callback.best_reward:.4f}")
+    print(f"best_episode               : {episode_stats_callback.best_episode}")
+    print(f"best_done_reason           : {episode_stats_callback.best_done_reason}")
+    print(
+        "best_final_position        : "
+        f"[{best_pos[0]:.3f}, {best_pos[1]:.3f}, {best_pos[2]:.3f}]"
+    )
+    print(f"{'='*80}\n")
 
     # Save model with timestamp
     output_dir = Path(__file__).resolve().parent / "output"
@@ -345,10 +707,19 @@ def main():
         "policy_mode": policy_mode,
         "total_timesteps": total_timesteps,
         "timestamp": current_time,
-        "max_episode_steps": env.max_steps,
-        "target_distance": env.target_distance,
-        "target_speed": env.target_speed,
-        "device": device,
+        "max_episode_steps": max_episode_steps,
+        "target_distance": 5.0,
+        "trajectory_type": "straight_t_profile",
+        "start_state": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "goal_state": [-5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "model_device": model_device,
+        "env_device": env_device,
+        "n_envs": n_envs,
+        "n_steps": n_steps,
+        "batch_size": batch_size,
+        "n_epochs": n_epochs,
+        "learning_rate": learning_rate,
+        "vec_mode": vec_mode,
     }
     
     import json

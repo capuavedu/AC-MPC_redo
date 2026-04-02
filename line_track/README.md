@@ -6,7 +6,7 @@ This package contains scripts for training and validating a PPO-based controller
 
 ### Task Definition
 - **Objective**: Navigate from origin (0, 0, 0) to target position (-5, 0, 0)
-- **Reference Motion**: Constant velocity of 1.0 m/s along -X axis
+- **Reference Motion**: Straight-line T-profile trajectory with start/end hover states
 - **Duration**: 5 seconds nominal (250 steps at dt=0.02s)
 - **Environment**: Real quadrotor dynamics from `drone.DroneDx`
 
@@ -71,7 +71,7 @@ output/
 
 #### Run validation on trained model
 ```bash
-python val.py --model_dir output/ppo_mpc_25-03-31_14-30-45 --n_episodes 5
+python val.py --model_dir output/ppo_mpc_25-03-31_14-30-45 --n_episodes 2
 ```
 
 #### Validation output options
@@ -115,7 +115,7 @@ validation/
 
 4. **X Velocity** (bottom-left)
    - Tracks velocity along primary axis
-   - Reference: -1.0 m/s (toward negative X)
+   - Reference comes from the planned T-profile trajectory
 
 5. **Thrust Command** (bottom-middle)
    - Total thrust over time
@@ -143,11 +143,9 @@ Key metrics printed to console:
 
 ### Reward Function
 ```python
-reward = 1.0                     # Base reward
-       - 3.0 * pos_error        # Position tracking (primary objective)
-       - 0.5 * vel_error        # Velocity tracking
-       - 0.3 * quaternion_error # Prefer level flight
-       - 0.01 * control_cost    # Minimize actuation
+reward = 5.0                  # Base reward
+   - 3.0 * pos_error      # Position tracking only
+   - 0.01 * control_cost  # Minimize actuation
 ```
 
 ### MPC Integration
@@ -157,7 +155,7 @@ reward = 1.0                     # Base reward
 
 ### Environment Structure
 - Episode length: 250 steps (5 seconds)
-- Termination: Out-of-bounds (>10m from origin)
+- Termination: Out-of-bounds (>20m from origin)
 - Truncation: Max steps reached
 - No random disturbances (deterministic environment)
 
@@ -216,7 +214,7 @@ line_track/
 
 ### Custom Flight Tasks
 Modify `RealDroneLineTrackEnv` in `train.py`:
-- `_target_position()`: Change reference trajectory shape (circular, figure-8, etc.)
+- `plan_straight_t_profile_trajectory()`: Change reference trajectory shape or timing law
 - `step()`: Add obstacles, wind, sensor noise
 - Reward function: Adjust coefficients for different priorities
 
