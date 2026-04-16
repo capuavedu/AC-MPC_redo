@@ -111,10 +111,47 @@ class IL_Env:
         upper[:,:,1] = self.true_dx.omega_max[0]
         upper[:,:,2] = self.true_dx.omega_max[1]
         upper[:,:,3] = self.true_dx.omega_max[2]
-        # 注意：这里会覆盖传入的 u_init，统一改为悬停推力初始化。
-        # 所以调用方传入的 warm-start 在当前实现中不会生效。
-        u_init = torch.zeros((self.mpc_T, n_batch, self.true_dx.n_ctrl)).to(device=this_device)
-        u_init[:, :, 0] = self.true_dx.mass * 9.8066
+
+        # ===== [旧逻辑：保留供对照，已停用] =====
+        # 注意：该逻辑会覆盖传入的 u_init，导致调用方 warm-start 不生效。
+        # u_init = torch.zeros((self.mpc_T, n_batch, self.true_dx.n_ctrl)).to(device=this_device)
+        # u_init[:, :, 0] = self.true_dx.mass * 9.8066
+
+        # ===== [新逻辑：启用] =====
+        # 优先使用调用方传入的 warm-start；仅在未提供时使用悬停推力初始化。
+        if u_init is None:
+            u_init = torch.zeros((self.mpc_T, n_batch, self.true_dx.n_ctrl)).to(device=this_device)
+            u_init[:, :, 0] = self.true_dx.mass * 9.8066
+        else:
+            u_init = u_init.to(device=this_device)
+
+            # 兼容不同 warm-start 形状，统一转换到 [T, batch, n_ctrl]
+            # 支持：
+            # - [T, batch, n_ctrl]
+            # - [batch, T, n_ctrl]
+            # - [batch, n_ctrl]
+            # - [n_ctrl, batch]  (历史实现常见)
+            if u_init.ndim == 3:
+                if u_init.shape == (self.mpc_T, n_batch, self.true_dx.n_ctrl):
+                    pass
+                elif u_init.shape == (n_batch, self.mpc_T, self.true_dx.n_ctrl):
+                    u_init = u_init.transpose(0, 1)
+                else:
+                    u_init = None
+            elif u_init.ndim == 2:
+                if u_init.shape == (n_batch, self.true_dx.n_ctrl):
+                    u_init = u_init.unsqueeze(0).repeat(self.mpc_T, 1, 1)
+                elif u_init.shape == (self.true_dx.n_ctrl, n_batch):
+                    u_init = u_init.transpose(0, 1).unsqueeze(0).repeat(self.mpc_T, 1, 1)
+                else:
+                    u_init = None
+            else:
+                u_init = None
+
+            # 非法输入回退到悬停初始化，避免训练中断
+            if u_init is None:
+                u_init = torch.zeros((self.mpc_T, n_batch, self.true_dx.n_ctrl)).to(device=this_device)
+                u_init[:, :, 0] = self.true_dx.mass * 9.8066
 
 
 

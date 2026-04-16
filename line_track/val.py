@@ -239,7 +239,7 @@ class TrajectoryAnalyzer:
 
         if self.save_dir:
             path = self.save_dir / save_name
-            fig.savefig(path, dpi=150, bbox_inches="tight")
+            fig.savefig(str(path), dpi=150, bbox_inches="tight")
             print(f"✓ Saved trajectory plot to: {path}")
 
         plt.close(fig)
@@ -285,6 +285,33 @@ class TrajectoryAnalyzer:
         print(f"✓ Saved trajectory data to: {self.save_dir / save_name}")
 
 
+class _TeeStream:
+    """Mirror stdout/stderr to both console and a log file."""
+
+    def __init__(self, console_stream, log_file_handle):
+        self._console_stream = console_stream
+        self._log_file_handle = log_file_handle
+
+    def write(self, data):
+        self._console_stream.write(data)
+        self._log_file_handle.write(data)
+
+    def flush(self):
+        self._console_stream.flush()
+        self._log_file_handle.flush()
+
+
+def _setup_validation_logging(results_dir: Path):
+    """Redirect stdout/stderr to both terminal and validation-local log file."""
+    log_path = results_dir / "validation_log.txt"
+    log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = _TeeStream(original_stdout, log_file)
+    sys.stderr = _TeeStream(original_stderr, log_file)
+    return log_file, original_stdout, original_stderr, log_path
+
+
 def main():
     import argparse
 
@@ -319,6 +346,13 @@ def main():
         default=True,
         help="Save detailed trajectory data",
     )
+    parser.add_argument(
+        "--model_variant",
+        type=str,
+        default="final",
+        choices=["final", "best"],
+        help="Which checkpoint to validate: final=policy, best=policy_best",
+    )
 
     args = parser.parse_args()
 
@@ -333,123 +367,145 @@ def main():
         print(f"✗ Metadata file not found: {metadata_path}")
         sys.exit(1)
 
-    with open(metadata_path, "r") as f:
-        metadata = json.load(f)
+    # Create output directory for validation results (split by final/best checkpoint).
+    results_suffix = "validation" if args.model_variant == "final" else "validation_best"
+    results_dir = model_dir / results_suffix
+    results_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n{'='*80}")
-    print(f"VALIDATION CONFIGURATION")
-    print(f"{'='*80}")
-    print(f"Model directory:    {model_dir}")
-    print(f"Policy mode:        {metadata['policy_mode']}")
-    print(f"Training timesteps: {metadata['total_timesteps']}")
-    print(f"Validation episodes: {args.n_episodes}")
-    #print(f"Device:             {metadata['device']}")
-    print(f"{'='*80}\n")
-
-    # MPC policy class expects ACMPC_T to be present (set during training).
-    if metadata.get("policy_mode", "") == "mpc":
-        os.environ.setdefault("ACMPC_T", "2")
-
-    # Load model from stable-baselines3 archive.
-    model_path = model_dir / "policy.zip"
-    if not model_path.exists():
-        model_path = model_dir / "policy"
+    log_file = None
+    original_stdout = None
+    original_stderr = None
+    log_path = None
 
     try:
-        model = PPO.load(model_path)
-        print(f"✓ Loaded model from: {model_path}\n")
-    except Exception as e:
-        print(f"✗ Failed to load model: {e}")
-        if isinstance(e, KeyError) and "ACMPC_T" in str(e):
-            print("Hint: set ACMPC_T before validation, e.g. set ACMPC_T=2")
-        sys.exit(1)
+        log_file, original_stdout, original_stderr, log_path = _setup_validation_logging(results_dir)
 
-    # Set up environment (match training metadata to avoid train/val task mismatch)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    max_episode_steps = int(metadata.get("max_episode_steps", 250))
-    target_distance = float(metadata.get("target_distance", 5.0))
-    start_state = metadata.get("start_state")
-    goal_state = metadata.get("goal_state")
-    start_state_np = np.asarray(start_state, dtype=np.float32).reshape(10) if start_state is not None else None
-    goal_state_np = np.asarray(goal_state, dtype=np.float32).reshape(10) if goal_state is not None else None
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
 
-    env = RealDroneLineTrackEnv(
-        max_steps=max_episode_steps,
-        target_distance=target_distance,
-        start_state=start_state_np,
-        goal_state=goal_state_np,
-        device=str(device),
-    )
+        print(f"\n{'='*80}")
+        print(f"VALIDATION CONFIGURATION")
+        print(f"{'='*80}")
+        print(f"Model directory:    {model_dir}")
+        print(f"Policy mode:        {metadata['policy_mode']}")
+        print(f"Training timesteps: {metadata['total_timesteps']}")
+        print(f"Validation episodes: {args.n_episodes}")
+        print(f"Model variant:      {args.model_variant}")
+        print(f"Log Path:           {log_path}")
+        #print(f"Device:             {metadata['device']}")
+        print(f"{'='*80}\n")
 
-    print(
-        "Validation env: "
-        f"max_steps={env.max_steps}, "
-        f"target_distance={env.target_distance:.3f}, "
-        f"dt={env.dt:.3f}s"
-    )
+        # MPC policy class expects ACMPC_T to be present (set during training).
+        if metadata.get("policy_mode", "") == "mpc":
+            os.environ.setdefault("ACMPC_T", "2")
 
-    # Create output directory for validation results
-    results_dir = model_dir / "validation"
-    if args.save_plots or args.save_data:
-        results_dir.mkdir(parents=True, exist_ok=True)
+        # Load model from stable-baselines3 archive.
+        saved_models = metadata.get("saved_models", {})
+        default_name = "policy.zip" if args.model_variant == "final" else "policy_best.zip"
+        model_file_name = saved_models.get(args.model_variant, default_name)
+        model_path = model_dir / model_file_name
 
-    analyzer = TrajectoryAnalyzer(save_dir=results_dir if (args.save_plots or args.save_data) else None)
+        if not model_path.exists():
+            fallback_stem = "policy" if args.model_variant == "final" else "policy_best"
+            model_path = model_dir / fallback_stem
 
-    # Run validation episodes
-    print(f"Running {args.n_episodes} validation episode(s)...\n")
-    for ep in range(args.n_episodes):
-        result = analyzer.run_validation_episode(
-            model=model,
-            env=env,
-            episode_idx=ep,
-            deterministic=args.deterministic,
+        try:
+            model = PPO.load(model_path)
+            print(f"✓ Loaded model from: {model_path}\n")
+        except Exception as e:
+            print(f"✗ Failed to load model: {e}")
+            if isinstance(e, KeyError) and "ACMPC_T" in str(e):
+                print("Hint: set ACMPC_T before validation, e.g. set ACMPC_T=2")
+            sys.exit(1)
+
+        # Set up environment (match training metadata to avoid train/val task mismatch)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        max_episode_steps = int(metadata.get("max_episode_steps", 250))
+        target_distance = float(metadata.get("target_distance", 5.0))
+        start_state = metadata.get("start_state")
+        goal_state = metadata.get("goal_state")
+        start_state_np = np.asarray(start_state, dtype=np.float32).reshape(10) if start_state is not None else None
+        goal_state_np = np.asarray(goal_state, dtype=np.float32).reshape(10) if goal_state is not None else None
+
+        env = RealDroneLineTrackEnv(
+            max_steps=max_episode_steps,
+            target_distance=target_distance,
+            start_state=start_state_np,
+            goal_state=goal_state_np,
+            device=str(device),
         )
-        analyzer.print_episode_summary(result)
-        
-        if args.save_plots:
-            analyzer.plot_trajectory(result, save_name=f"episode_{ep:03d}_trajectory.png")
-        if args.save_data:
-            analyzer.save_detailed_data(result, save_name=f"episode_{ep:03d}_data.npz")
 
-    # Save summary statistics
-    if analyzer.trajectories:
-        # Convert numpy arrays to native Python types for JSON serialization
-        def convert_to_native(obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, (np.integer, np.floating)):
-                return float(obj)
-            elif isinstance(obj, dict):
-                return {k: convert_to_native(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_to_native(v) for v in obj]
-            return obj
+        print(
+            "Validation env: "
+            f"max_steps={env.max_steps}, "
+            f"target_distance={env.target_distance:.3f}, "
+            f"dt={env.dt:.3f}s"
+        )
 
-        summary = {
-            "n_episodes": len(analyzer.trajectories),
-            "episodes": [convert_to_native(t["stats"]) for t in analyzer.trajectories],
-        }
-        
-        # Compute aggregate statistics
-        all_pos_errors = np.concatenate([t["traj"]["pos_error"] for t in analyzer.trajectories])
-        all_vel_errors = np.concatenate([t["traj"]["vel_error"] for t in analyzer.trajectories])
-        
-        summary["aggregate"] = {
-            "pos_error_mean": float(np.mean(all_pos_errors)),
-            "pos_error_std": float(np.std(all_pos_errors)),
-            "vel_error_mean": float(np.mean(all_vel_errors)),
-            "vel_error_std": float(np.std(all_vel_errors)),
-        }
+        analyzer = TrajectoryAnalyzer(save_dir=results_dir if (args.save_plots or args.save_data) else None)
 
-        if results_dir:
-            with open(results_dir / "validation_summary.json", "w") as f:
-                json.dump(summary, f, indent=2)
-            print(f"\n✓ Saved validation summary to: {results_dir / 'validation_summary.json'}")
+        # Run validation episodes
+        print(f"Running {args.n_episodes} validation episode(s)...\n")
+        for ep in range(args.n_episodes):
+            result = analyzer.run_validation_episode(
+                model=model,
+                env=env,
+                episode_idx=ep,
+                deterministic=args.deterministic,
+            )
+            analyzer.print_episode_summary(result)
+            
+            if args.save_plots:
+                analyzer.plot_trajectory(result, save_name=f"episode_{ep:03d}_trajectory.png")
+            if args.save_data:
+                analyzer.save_detailed_data(result, save_name=f"episode_{ep:03d}_data.npz")
 
-    print(f"\n{'='*80}")
-    print(f"VALIDATION COMPLETE")
-    print(f"Results saved to: {results_dir}")
-    print(f"{'='*80}\n")
+        # Save summary statistics
+        if analyzer.trajectories:
+            # Convert numpy arrays to native Python types for JSON serialization
+            def convert_to_native(obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, (np.integer, np.floating)):
+                    return float(obj)
+                elif isinstance(obj, dict):
+                    return {k: convert_to_native(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_to_native(v) for v in obj]
+                return obj
+
+            summary = {
+                "n_episodes": len(analyzer.trajectories),
+                "episodes": [convert_to_native(t["stats"]) for t in analyzer.trajectories],
+            }
+            
+            # Compute aggregate statistics
+            all_pos_errors = np.concatenate([t["traj"]["pos_error"] for t in analyzer.trajectories])
+            all_vel_errors = np.concatenate([t["traj"]["vel_error"] for t in analyzer.trajectories])
+            
+            summary["aggregate"] = {
+                "pos_error_mean": float(np.mean(all_pos_errors)),
+                "pos_error_std": float(np.std(all_pos_errors)),
+                "vel_error_mean": float(np.mean(all_vel_errors)),
+                "vel_error_std": float(np.std(all_vel_errors)),
+            }
+
+            if results_dir:
+                with open(results_dir / "validation_summary.json", "w") as f:
+                    json.dump(summary, f, indent=2)
+                print(f"\n✓ Saved validation summary to: {results_dir / 'validation_summary.json'}")
+
+        print(f"\n{'='*80}")
+        print(f"VALIDATION COMPLETE")
+        print(f"Results saved to: {results_dir}")
+        print(f"{'='*80}\n")
+    finally:
+        if log_file is not None:
+            try:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+            finally:
+                log_file.close()
 
 
 if __name__ == "__main__":
