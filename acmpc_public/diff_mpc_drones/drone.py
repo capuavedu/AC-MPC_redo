@@ -31,8 +31,11 @@ plt.style.use('bmh')
 def exp_map(w, delta_t):
     # 指数映射：将角速度(轴角)在 delta_t 内的增量映射到单位四元数
     # 输入 w 形状约为 [3, batch]，输出 [4, batch]
-    w_norm = torch.norm(w, dim=0)
-    w_normalized = torch.nn.functional.normalize(w, dim=0)
+# 替换为：添加微小的 epsilon 防止在 w=0 时梯度变为 NaN
+    w_norm = torch.sqrt(torch.sum(w**2, dim=0) + 1e-8) 
+    
+    # 为了绝对安全，在归一化时的分母上也加上 epsilon
+    w_normalized = w / (w_norm + 1e-8)
     ans  = torch.stack([torch.cos(torch.mul(w_norm, delta_t * 0.5)),
                         w_normalized[0,:] * torch.sin(torch.mul(w_norm, delta_t * 0.5)),
                         w_normalized[1,:] * torch.sin(torch.mul(w_norm, delta_t * 0.5)),

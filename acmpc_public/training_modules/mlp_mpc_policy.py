@@ -1,15 +1,20 @@
+import sys
 import os
 
-from ..diff_mpc_drones import drone
-from ..diff_mpc_drones import il_env
+DRONE_PATH = os.path.join(os.path.dirname(__file__), "..", "diff_mpc_drones")
+
+
+sys.path.append(DRONE_PATH)
+
+import drone
+import il_env
 
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
-    
+
 from gym import spaces
 import torch as th
 from torch import nn
 
-from stable_baselines3 import PPO
 from stable_baselines3.common.policies import ActorCriticPolicy
 
 
@@ -39,17 +44,13 @@ class CustomNetwork(nn.Module):
         self.latent_dim_vf = last_layer_dim_vf
 
 
-        # MPC 时域长度（由环境变量 ACMPC_T 注入）
         self.T = int(os.environ["ACMPC_T"])
         self.n_o = 28
-        # 每个时刻输出 28 个参数：
-        # - Q 对角元素 14 个（p3 + q4 + v3 + thrust1 + omega3）
-        # - p 线性项 14 个（同顺序）
         self.n_output = self.n_o * self.T
         self.device = th.device('cuda' if th.cuda.is_available() else 'cpu')
         self.predictions = th.zeros((self.T, 1, 17)).to(device=self.device)
 
-        # Policy 网络不直接输出动作，而是输出 MPC 代价参数（跨整个预测时域）
+        # Policy network
         self.policy_net = nn.Sequential(
             nn.Linear(self.features_in_dim, 512), nn.GELU(),
             nn.Linear(512, 512), nn.GELU(),
@@ -58,37 +59,57 @@ class CustomNetwork(nn.Module):
         )
         # Value network
         self.value_net = nn.Sequential(
-            nn.Linear(self.features_in_dim, 512), nn.GELU(),
-            nn.Linear(512, 512), nn.GELU()
+            nn.Linear(self.features_in_dim, 512), nn.GELU(), nn.Linear(512, 512), nn.GELU()
         )
 
 
-        # mpc_env 负责调用底层可微/可批量 MPC 求解器
         self.mpc_env = il_env.IL_Env("drone", mpc_T=self.T)
         self.dx = drone.DroneDx(device=self.device)
-        # warm-start 控制（上一时刻首控制）用于提高求解稳定性/速度
         self.u_prev = None
+        # 周期性内存日志计数与间隔（可通过环境变量调整）
+        self._mem_log_counter = 0
+        try:
+            self._mem_log_interval = int(os.environ.get("MPC_MEM_LOG_INTERVAL", "5000"))
+        except Exception:
+            self._mem_log_interval = 5000
 
         print(self.policy_net)
         print(self.value_net)
 
-    def forward(
-        self,
-        features: th.Tensor,
-        states: Optional[th.Tensor] = None,
-    ) -> Tuple[th.Tensor, th.Tensor]:
+    def forward(self, features: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
         """
         :return: (th.Tensor, th.Tensor) latent_policy, latent_value of the specified network.
             If all layers are shared, then ``latent_policy == latent_value``
         """ 
-        # SB3 默认仅传 features；在这种情况下用 features 作为状态输入。
-        if states is None:
-            states = features
-        return self.forward_actor(features, states), self.forward_critic(features)
+        return self.forward_actor(features), self.forward_critic(features)
 
-    def forward_actor(self, features: th.Tensor, states: Optional[th.Tensor] = None) -> th.Tensor:
 
-        # SB3 在推理时可能只传 features；此时用 features 作为状态
+    def forward_actor(self, features: th.Tensor, states: th.Tensor = None) -> th.Tensor:
+
+        # 周期性资源监控（减少日志频率以免刷屏）
+        try:
+            self._mem_log_counter += 1
+        except Exception:
+            self._mem_log_counter = 1
+
+        if self._mem_log_counter % max(1, self._mem_log_interval) == 0:
+            try:
+                import psutil
+                import pynvml
+                process = psutil.Process(os.getpid())
+                mem_info = process.memory_info()
+                rss_mb = mem_info.rss / 1024 / 1024
+                vms_mb = mem_info.vms / 1024 / 1024
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                gpu_mem_used = mem.used / 1024 / 1024
+                gpu_mem_total = mem.total / 1024 / 1024
+                gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+                print(f"[MPC_POLICY][MEM] RAM: {rss_mb:.1f}MB RSS, {vms_mb:.1f}MB VMS | GPU: {gpu_mem_used:.1f}/{gpu_mem_total:.1f} MB, Util: {gpu_util}%")
+            except Exception as e:
+                print(f"[MPC_POLICY][MEM] 资源监控失败: {e}")
+
         if states is None:
             states = features
 
@@ -97,10 +118,10 @@ class CustomNetwork(nn.Module):
         if (states.ndimension() == 1):
             states = th.unsqueeze(states, dim=0)
 
-        # 环境状态只取前 10 维，需与 DroneDx.n_state 一致：[p,q,v]
+        # [p, q, v]:
         states = states[:, 0:10]
 
-        # 前向 MLP：输出 [0,1] 区间代价参数，后续做尺度变换映射到真实范围
+        # Forward MLP to get cost function for MPC
         sigmoid_cost_all = self.policy_net(features_in)
 
         # Solve optimization in smaller batches
@@ -110,42 +131,35 @@ class CustomNetwork(nn.Module):
         # n_chunks = n_batch // chunk_length + 1
 
         chunks = th.split(sigmoid_cost_all, chunk_length, dim=0)
-        # 代价缩放参数：
-        # - Q 取正值（加 epsilon 防止过小）
-        # - p 允许正负（中心化后放缩）
         epsilon = 0.1
-        range_Q = 100000.0
-        range_p = 100000.0
+        range_Q = 100.0
+        range_p = 100.0
         range_p_t = 2 * range_Q / 2 * self.dx.mass * 9.806
         n_tau = 14
 
 
-        # 首次调用无 warm-start 时，使用悬停推力初始化
         if (self.u_prev is None):
             self.u_prev = th.zeros(4, n_batch).to(device=self.device)
             self.u_prev[0, :] = self.dx.mass * 9.806
 
 
         # Containers for full solution
-        nom_x = th.zeros((n_batch, self.T, self.dx.n_state)).to(device=self.device)
-        nom_u = th.zeros((n_batch, self.T, self.dx.n_ctrl)).to(device=self.device)
+        nom_x = th.zeros((n_batch, self.T, self.dx.n_state)).to(self.device)
+        nom_u = th.zeros((n_batch, self.T, self.dx.n_ctrl)).to(self.device)
         idx_start = 0
 
         for idx, sigmoid_cost in enumerate(chunks):
             n_chunk = sigmoid_cost.shape[0]
             idx_end = idx_start + n_chunk
-            # 按时域展开的 [Q参数 | p参数]，当前均在 [0,1]
-            x_Q = sigmoid_cost[:, :14*self.T].to(device=self.device)
-            x_p = sigmoid_cost[:, 14*self.T:].to(device=self.device)
+            x_Q = sigmoid_cost[:, :14*self.T].to(self.device)  # these are between 0 and 1 right now
+            x_p = sigmoid_cost[:, 14*self.T:].to(self.device)  # these are between 0 and 1 right now
 
-            # Q 对角项分组（均保持正值）
             q_p = x_Q[:, :3*self.T] * range_Q + epsilon
             q_q = x_Q[:, 3*self.T:7*self.T] * range_Q + epsilon
             q_v = x_Q[:, 7*self.T:10*self.T] * range_Q + epsilon
             q_w = x_Q[:, 10*self.T:13*self.T] * range_Q + epsilon
             q_t = x_Q[:, 13*self.T:14*self.T] * range_Q + epsilon
 
-            # p 线性项分组（中心化后可正可负）
             p_p = (x_p[:, :3*self.T] - 0.5) * range_p
             p_q = (x_p[:, 3*self.T:7*self.T] - 0.5) * range_p
             p_v = (x_p[:, 7*self.T:10*self.T] - 0.5) * range_p
@@ -162,7 +176,6 @@ class CustomNetwork(nn.Module):
 
             for i in range(self.T):
 
-                # 每个时刻构造 14x14 对角代价矩阵 Q_i 和向量 p_i
                 Q_diag_embed_i = th.diag_embed(th.cat([q_p[:, i*3:i*3+3],
                                                          q_q[:, i*4:i*4+4],
                                                          q_v[:,i*3:i*3+3],
@@ -182,7 +195,7 @@ class CustomNetwork(nn.Module):
                 _p[i, :, :] = p_i
 
 
-            # 调用 MPC：输入 (动力学, 初始状态, 全时域 Q/p, warm-start 控制)
+            # Run MPC
             nom_x_chunk, nom_u_chunk = self.mpc_env.mpc(
                 self.dx, states_chunk, _Q, _p,
                 # u_init=train_warmstart[idxs].transpose(0,1),
@@ -196,19 +209,18 @@ class CustomNetwork(nn.Module):
             idx_start = idx_end
 
 
-        # 更新 warm-start：保留本次最优序列第一步控制作为下次初值
         self.u_prev = nom_u[:,0,:].transpose(0,1)
 
         self.predictions = th.cat((nom_x, nom_u), dim=2).detach()
 
 
-        # MPC 输出动作（真实物理量）-> PPO 分布头所需归一化动作
-        # 第一维先转为比推力（除以质量）
+        # Return actions from MPC. These actions will be taken into account to create a gaussian distribution.
+        # Units of first control input are thrust normalized by mass
         thrust = nom_u[:, 0, 0]/self.dx.mass
-        # 其余三维是机体系角速度(rad/s)
+        # The other 3 control inputs are the body rates, in rad/s
         omegas = nom_u[:,0,1:4]
 
-        # 归一化约定：环境会在后处理中反归一化
+        # Now we normalize the units, since the simulation environment later will unnormalize them by default
         normalization_max = 8.5 # Max thrust per rotor in Newtons
         force_mean = (normalization_max * 4 / self.dx.mass) / 2.0
         force_std = (normalization_max * 4 / self.dx.mass) / 2.0
@@ -245,10 +257,13 @@ class MlpMpcPolicy(ActorCriticPolicy):
             observation_space,
             action_space,
             lr_schedule,
+            # Pass remaining arguments to base class
             *args,
             **kwargs,
         )
 
+        self.log_std.data.fill_(-100.0)
+        self.log_std.requires_grad = False
+
     def _build_mlp_extractor(self) -> None:
         self.mlp_extractor = CustomNetwork(self.features_dim)
-

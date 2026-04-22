@@ -52,8 +52,8 @@ from acmpc_public.diff_mpc_drones import drone
 
 # Editable in-code defaults. Environment variables with the same names still override these values.
 DEFAULT_CONFIG = {
-    "POLICY_MODE": "mlp",
-    "TOTAL_TIMESTEPS": 2000000,
+    "POLICY_MODE": "mpc",
+    "TOTAL_TIMESTEPS": 200000,
     "N_ENVS": 8,  # auto-computed when None
     "N_STEPS": 4096,
     "BATCH_SIZE": 256,
@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
     "ENV_DEVICE": "cpu",
     "MAX_EPISODE_STEPS": 250,  # 5s horizon at dt=0.02 for the line-track task
 }
+
+
 
 
 def _get_cfg(name: str, default_value, cast_fn):
@@ -531,7 +533,7 @@ class RealDroneLineTrackEnv(gym.Env):
         # Penalize control effort relative to hover, not absolute thrust.
         control_vec = torch.cat([thrust_delta_norm.unsqueeze(0), a[1:4] / self.u_high[1:4]])
         control_cost = 0.01 * control_vec.norm()
-        reward = 5.0 - 3.0 * pos_error - 0.1*pos_error - 0.5*vel_error - 0.1*q_error - control_cost
+        reward = 5.0 - 3.0 * pos_error  - 0.5*vel_error - 0.1*q_error - control_cost
 
         # Terminal conditions (scalar bool)
         terminated = bool(pos.norm().item() > 15.0)
@@ -640,162 +642,208 @@ def main():
     original_stderr = None
     log_path = None
 
-    try:
-        log_file, original_stdout, original_stderr, log_path = _setup_run_logging(run_dir)
-
-        if vec_mode not in {"subproc", "dummy"}:
-            raise ValueError("VEC_MODE must be 'subproc' or 'dummy'")
-
-        if n_envs <= 1:
-            vec_mode = "dummy"
-
-        # 多进程 + CUDA 环境通常会导致显存与上下文开销异常，这里默认转回 CPU 环境。
-        if vec_mode == "subproc" and env_device == "cuda":
-            print("[WARNING] ENV_DEVICE=cuda with VEC_MODE=subproc is not recommended; force ENV_DEVICE=cpu")
-            env_device = "cpu"
-
-        # For MPC policy, set prediction horizon
-        if policy_mode == "mpc":
-            os.environ.setdefault("ACMPC_T", "2")
-        print_torch_runtime_info()
-
-        rollout_size = n_steps * n_envs
-        batch_size = _choose_batch_size(rollout_size=rollout_size, preferred_batch=preferred_batch_size)
-        minibatches_per_epoch = rollout_size // batch_size
-        updates_per_episode_est = float(max_episode_steps) / float(n_steps)
-        minibatches_per_episode_est = updates_per_episode_est * minibatches_per_epoch * n_epochs
-
-        print(f"\n{'='*80}")
-        print(f"Training Configuration")
-        print(f"{'='*80}")
-        print(f"Policy Mode       : {policy_mode}")
-        print(f"Total Timesteps   : {total_timesteps}")
-        print(f"Model Device      : {model_device}")
-        print(f"Env Device        : {env_device}")
-        print(f"Vec Mode          : {vec_mode}")
-        print(f"N Env             : {n_envs}")
-        print(f"N Steps           : {n_steps}")
-        print(f"Max Episode Steps : {max_episode_steps}")
-        print(f"Rollout Size      : {rollout_size}")
-        print(f"Batch Size        : {batch_size}")
-        print(f"N Epochs          : {n_epochs}")
-        print(f"Learning Rate     : {learning_rate}")
-        print(f"MiniBatch/Epoch   : {minibatches_per_epoch}")
-        print(f"Est Batch/Episode : {minibatches_per_episode_est:.2f}")
-        if policy_mode == "mpc":
-            print(f"MPC Horizon (T)   : {os.environ.get('ACMPC_T', '2')}")
-        print(f"Log Path          : {log_path}")
-        print(f"{'='*80}\n")
-
-        # Policy registry
-        policy_registry = {
-            "mpc": MlpMpcPolicy,
-            "mlp": MlpOnlyPolicy,
-        }
-
-        if policy_mode not in policy_registry:
-            raise ValueError(f"Unsupported POLICY_MODE: {policy_mode}. Choose from {list(policy_registry.keys())}")
-
-        # Create vectorized environment and policy
-        vec_env_cls = SubprocVecEnv if vec_mode == "subproc" else DummyVecEnv
-        env = make_vec_env(
-            RealDroneLineTrackEnv,
-            n_envs=n_envs,
-            seed=0,
-            env_kwargs={"device": env_device, "max_steps": max_episode_steps},
-            vec_env_cls=vec_env_cls,
-        )
-        policy_class = policy_registry[policy_mode]
-
-        # Create PPO model
-        model = PPO(
-            policy=policy_class,
-            env=env,
-            verbose=0,
-            n_steps=n_steps,
-            batch_size=batch_size,
-            n_epochs=n_epochs,
-            learning_rate=learning_rate,
-            gamma=0.99,
-            clip_range=0.2,
-            device=model_device,
-        )
-
-        # Train
-        print(f"Starting training for {total_timesteps} timesteps...\n")
-        train_start_time = time.perf_counter()
-        episode_stats_callback = EpisodeStatsCallback(save_best_path=run_dir / "policy_best")
-        model.learn(total_timesteps=total_timesteps, callback=episode_stats_callback)
-        train_elapsed_seconds = time.perf_counter() - train_start_time
-
-        best_pos = episode_stats_callback.best_final_position
-        print(f"\n{'='*80}")
-        print("Final Best Episode Summary")
-        print(f"{'='*80}")
-        print(f"best_reward                : {episode_stats_callback.best_reward:.4f}")
-        print(f"best_episode               : {episode_stats_callback.best_episode}")
-        print(f"best_done_reason           : {episode_stats_callback.best_done_reason}")
-        print(
-            "best_final_position        : "
-            f"[{best_pos[0]:.3f}, {best_pos[1]:.3f}, {best_pos[2]:.3f}]"
-        )
-        print(f"train_elapsed_seconds      : {train_elapsed_seconds:.2f}")
-        print(f"train_elapsed_hms          : {time.strftime('%H:%M:%S', time.gmtime(train_elapsed_seconds))}")
-        print(f"{'='*80}\n")
-
-        # Save final model snapshot (the last parameters after all updates).
-        model.save(run_dir / "policy")
-        if not episode_stats_callback.best_model_saved:
-            # Fallback for very short runs where no episode completed.
-            model.save(run_dir / "policy_best")
-    
-        metadata = {
-            "policy_mode": policy_mode,
-            "total_timesteps": total_timesteps,
-            "timestamp": current_time,
-            "timestamp_format": "MMDDHHMM",
-            "max_episode_steps": max_episode_steps,
-            "target_distance": 5.0,
-            "trajectory_type": "straight_t_profile",
-            "start_state": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            "goal_state": [-5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            "model_device": model_device,
-            "env_device": env_device,
-            "n_envs": n_envs,
-            "n_steps": n_steps,
-            "batch_size": batch_size,
-            "n_epochs": n_epochs,
-            "learning_rate": learning_rate,
-            "vec_mode": vec_mode,
-            "saved_models": {
-                "final": "policy.zip",
-                "best": "policy_best.zip",
-            },
-            "best_training_episode": int(episode_stats_callback.best_episode),
-            "best_training_reward": float(episode_stats_callback.best_reward),
-            "training_time_seconds": float(train_elapsed_seconds),
-            "training_time_hms": time.strftime('%H:%M:%S', time.gmtime(train_elapsed_seconds)),
-            "training_log_file": "training_log.txt",
-        }
-    
-        import json
-        with open(run_dir / "metadata.json", "w") as f:
-            json.dump(metadata, f, indent=2)
-
-        print(f"\n{'='*80}")
-        print(f"Training Complete")
-        print(f"{'='*80}")
-        print(f"Model saved to: {run_dir}")
-        print(f"Training log  : {log_path}")
-        print(f"{'='*80}\n")
-    finally:
-        if log_file is not None:
+    # 定义资源监控函数（延迟导入以避免顶层依赖）
+    def log_resource_usage(tag=""):
+        try:
+            import psutil
+            import pynvml
+            pynvml.nvmlInit()
+            process = psutil.Process(os.getpid())
+            mem_info = process.memory_info()
+            rss_mb = mem_info.rss / 1024 / 1024
+            vms_mb = mem_info.vms / 1024 / 1024
             try:
-                sys.stdout = original_stdout
-                sys.stderr = original_stderr
-            finally:
-                log_file.close()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                gpu_mem_used = mem.used / 1024 / 1024
+                gpu_mem_total = mem.total / 1024 / 1024
+                gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+                gpu_info = f"GPU: {gpu_mem_used:.1f}/{gpu_mem_total:.1f} MB, Util: {gpu_util}%"
+            except Exception:
+                gpu_info = "GPU: unavailable"
+            print(f"[RESOURCE]{tag} RAM: {rss_mb:.1f}MB RSS, {vms_mb:.1f}MB VMS | {gpu_info}")
+        except Exception as e:
+            print(f"[RESOURCE] failed: {e}")
+
+    # 计算训练相关配置
+    rollout_size = n_steps * n_envs
+    batch_size = _choose_batch_size(rollout_size=rollout_size, preferred_batch=preferred_batch_size)
+    minibatches_per_epoch = rollout_size // batch_size
+    updates_per_episode_est = float(max_episode_steps) / float(n_steps)
+    minibatches_per_episode_est = updates_per_episode_est * minibatches_per_epoch * n_epochs
+
+    # 重定向所有输出到日志文件（同时保留终端输出）
+    log_file, original_stdout, original_stderr, log_path = _setup_run_logging(run_dir)
+
+    # 确保 MPC 相关环境变量在构建策略前存在
+    if policy_mode == "mpc":
+        os.environ.setdefault("ACMPC_T", "2")
+
+    log_resource_usage(" [BEFORE TRAIN]")
+
+    # ...原有配置打印...
+    print(f"\n{'='*80}")
+    print(f"Training Configuration")
+    print(f"{'='*80}")
+    print(f"Policy Mode       : {policy_mode}")
+    print(f"Total Timesteps   : {total_timesteps}")
+    print(f"Model Device      : {model_device}")
+    print(f"Env Device        : {env_device}")
+    print(f"Vec Mode          : {vec_mode}")
+    print(f"N Env             : {n_envs}")
+    print(f"N Steps           : {n_steps}")
+    print(f"Max Episode Steps : {max_episode_steps}")
+    print(f"Rollout Size      : {rollout_size}")
+    print(f"Batch Size        : {batch_size}")
+    print(f"N Epochs          : {n_epochs}")
+    print(f"Learning Rate     : {learning_rate}")
+    print(f"MiniBatch/Epoch   : {minibatches_per_epoch}")
+    print(f"Est Batch/Episode : {minibatches_per_episode_est:.2f}")
+    if policy_mode == "mpc":
+        print(f"MPC Horizon (T)   : {os.environ.get('ACMPC_T', '2')}")
+    print(f"Log Path          : {log_path}")
+    print(f"{'='*80}\n")
+
+    # Policy registry
+    policy_registry = {
+        "mpc": MlpMpcPolicy,
+        "mlp": MlpOnlyPolicy,
+    }
+
+    if policy_mode not in policy_registry:
+        raise ValueError(f"Unsupported POLICY_MODE: {policy_mode}. Choose from {list(policy_registry.keys())}")
+
+    # Create vectorized environment and policy
+    vec_env_cls = SubprocVecEnv if vec_mode == "subproc" else DummyVecEnv
+    env = make_vec_env(
+        RealDroneLineTrackEnv,
+        n_envs=n_envs,
+        seed=0,
+        env_kwargs={"device": env_device, "max_steps": max_episode_steps},
+        vec_env_cls=vec_env_cls,
+    )
+    policy_class = policy_registry[policy_mode]
+
+    # Create PPO model
+    model = PPO(
+        policy=policy_class,
+        env=env,
+        verbose=0,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        learning_rate=learning_rate,
+        gamma=0.99,
+        clip_range=0.2,
+        device=model_device,
+    )
+
+    # Train
+    print(f"Starting training for {total_timesteps} timesteps...\n")
+    train_start_time = time.perf_counter()
+    episode_stats_callback = EpisodeStatsCallback(save_best_path=run_dir / "policy_best")
+
+    # 训练时每N步记录一次资源占用
+    class ResourceLogCallback(BaseCallback):
+        def __init__(self, log_interval=5000):
+            super().__init__()
+            self.log_interval = log_interval
+            self.last_log = 0
+
+        def _on_step(self) -> bool:
+            if self.num_timesteps - self.last_log >= self.log_interval:
+                log_resource_usage(f" [TRAIN step={self.num_timesteps}]")
+                self.last_log = self.num_timesteps
+            return True
+
+    resource_callback = ResourceLogCallback(log_interval=1000)
+    from stable_baselines3.common.callbacks import CallbackList
+    callbacks = CallbackList([episode_stats_callback, resource_callback])
+
+    model.learn(total_timesteps=total_timesteps, callback=callbacks)
+    train_elapsed_seconds = time.perf_counter() - train_start_time
+
+    log_resource_usage(" [AFTER TRAIN]")
+
+    best_pos = episode_stats_callback.best_final_position
+    print(f"\n{'='*80}")
+    print("Final Best Episode Summary")
+    print(f"{'='*80}")
+    print(f"best_reward                : {episode_stats_callback.best_reward:.4f}")
+    print(f"best_episode               : {episode_stats_callback.best_episode}")
+    print(f"best_done_reason           : {episode_stats_callback.best_done_reason}")
+    print(
+        "best_final_position        : "
+        f"[{best_pos[0]:.3f}, {best_pos[1]:.3f}, {best_pos[2]:.3f}]"
+    )
+    print(f"train_elapsed_seconds      : {train_elapsed_seconds:.2f}")
+    print(f"train_elapsed_hms          : {time.strftime('%H:%M:%S', time.gmtime(train_elapsed_seconds))}")
+    print(f"{'='*80}\n")
+
+    # Save final model snapshot (the last parameters after all updates).
+    model.save(run_dir / "policy")
+    if not episode_stats_callback.best_model_saved:
+        # Fallback for very short runs where no episode completed.
+        model.save(run_dir / "policy_best")
+
+    metadata = {
+        "policy_mode": policy_mode,
+        "total_timesteps": total_timesteps,
+        "timestamp": current_time,
+        "timestamp_format": "MMDDHHMM",
+        "max_episode_steps": max_episode_steps,
+        "target_distance": 5.0,
+        "trajectory_type": "straight_t_profile",
+        "start_state": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "goal_state": [-5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "model_device": model_device,
+        "env_device": env_device,
+        "n_envs": n_envs,
+        "n_steps": n_steps,
+        "batch_size": batch_size,
+        "n_epochs": n_epochs,
+        "learning_rate": learning_rate,
+        "vec_mode": vec_mode,
+        "saved_models": {
+            "final": "policy.zip",
+            "best": "policy_best.zip",
+        },
+        "best_training_episode": int(episode_stats_callback.best_episode),
+        "best_training_reward": float(episode_stats_callback.best_reward),
+        "training_time_seconds": float(train_elapsed_seconds),
+        "training_time_hms": time.strftime('%H:%M:%S', time.gmtime(train_elapsed_seconds)),
+        "training_log_file": "training_log.txt",
+    }
+
+    import json
+    with open(run_dir / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"\n{'='*80}")
+    print(f"Training Complete")
+    print(f"{'='*80}")
+    print(f"Model saved to: {run_dir}")
+    print(f"Training log  : {log_path}")
+    print(f"{'='*80}\n")
+    # 清理（恢复 stdout/stderr 并关闭日志文件）
+    if log_file is not None:
+        try:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+        finally:
+            log_file.close()
 
 
 if __name__ == "__main__":
+    # 检查依赖
+    try:
+        import psutil
+    except ImportError:
+        print("[ERROR] 缺少psutil库，请先运行: pip install psutil 或 conda install psutil")
+        sys.exit(1)
+    try:
+        import pynvml
+    except ImportError:
+        print("[ERROR] 缺少nvidia-ml-py3库，请先运行: pip install nvidia-ml-py3 或 conda install -c conda-forge nvidia-ml-py3")
+        sys.exit(1)
     main()

@@ -27,7 +27,7 @@ from torch import optim
 from torch.nn.utils import parameters_to_vector
 from scipy import interpolate
 
-from . import drone
+import drone
 
 # ==========================================
 # 该文件作用：MPC 求解封装层（策略网络与动力学模型之间的桥）
