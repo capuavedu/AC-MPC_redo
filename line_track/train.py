@@ -14,6 +14,7 @@ Policy modes:
   - 'mlp': Uses pure MLP policy
 """
 
+import gc
 import os
 import sys
 import subprocess
@@ -27,14 +28,14 @@ from datetime import datetime
 # Add parent directory to path so we can import acmpc_public
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import gym
+import gymnasium as gym
 import numpy as np
-from gym import spaces
+from gymnasium import spaces
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecCheckNan
 
 # Suppress known third-party warning from mpc package (torch.uint8 mask deprecation).
 warnings.filterwarnings(
@@ -53,7 +54,7 @@ from acmpc_public.diff_mpc_drones import drone
 # Editable in-code defaults. Environment variables with the same names still override these values.
 DEFAULT_CONFIG = {
     "POLICY_MODE": "mpc",
-    "TOTAL_TIMESTEPS": 200000,
+    "TOTAL_TIMESTEPS": 2000000,
     "N_ENVS": 8,  # auto-computed when None
     "N_STEPS": 4096,
     "BATCH_SIZE": 256,
@@ -128,6 +129,7 @@ class EpisodeStatsCallback(BaseCallback):
 
         if rewards.size == 0 or dones.size == 0:
             return True
+        rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
         if self._episode_returns is None:
             self._episode_returns = np.zeros_like(rewards, dtype=np.float32)
@@ -459,7 +461,8 @@ class RealDroneLineTrackEnv(gym.Env):
     def _get_obs(self) -> np.ndarray:
         """Convert internal torch tensor to numpy for gym interface."""
         assert self.state is not None
-        return self.state.cpu().numpy().astype(np.float32)
+        obs = self.state.detach().cpu().numpy().astype(np.float32)
+        return np.nan_to_num(obs, nan=0.0, posinf=1e3, neginf=-1e3)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -489,6 +492,13 @@ class RealDroneLineTrackEnv(gym.Env):
                 self.reference_quat = torch.as_tensor(trajectory["quaternion"], dtype=torch.float32, device=self.device)
 
         self.state = torch.as_tensor(self.start_state_np, dtype=torch.float32, device=self.device).clone()
+        self.state = torch.nan_to_num(self.state, nan=0.0, posinf=0.0, neginf=0.0)
+        quat = self.state[3:7]
+        quat_norm = quat.norm()
+        if bool(torch.isfinite(quat_norm)) and float(quat_norm.item()) > 1e-6:
+            self.state[3:7] = quat / quat_norm
+        else:
+            self.state[3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=self.device)
 
         ref = self.get_reference(step=0)
         info = {
@@ -505,6 +515,7 @@ class RealDroneLineTrackEnv(gym.Env):
         # Convert incoming action (numpy from SB3) to torch immediately.
         # a[0] is normalized thrust delta, mapped to physical thrust around hover.
         a = torch.as_tensor(action, dtype=torch.float32, device=self.device)
+        a = torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
         a = a.clamp(self.u_low, self.u_high)
 
         thrust_delta_norm = a[0]
@@ -515,7 +526,18 @@ class RealDroneLineTrackEnv(gym.Env):
         # Advance dynamics: fully torch, no numpy conversion
         with torch.no_grad():
             x_next = self.dx.forward(self.state.unsqueeze(0), u.unsqueeze(0))  # [1, 10]
-        self.state = x_next.squeeze(0)
+        x_next = x_next.squeeze(0)
+        state_has_nonfinite = not bool(torch.isfinite(x_next).all().item())
+        if state_has_nonfinite:
+            # Keep the previous state as a safe fallback when dynamics diverges.
+            x_next = self.state.clone()
+        self.state = torch.nan_to_num(x_next, nan=0.0, posinf=0.0, neginf=0.0)
+        quat = self.state[3:7]
+        quat_norm = quat.norm()
+        if bool(torch.isfinite(quat_norm)) and float(quat_norm.item()) > 1e-6:
+            self.state[3:7] = quat / quat_norm
+        else:
+            self.state[3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=self.device)
         self.step_count += 1
 
         # Slice state (still on device)
@@ -534,36 +556,40 @@ class RealDroneLineTrackEnv(gym.Env):
         control_vec = torch.cat([thrust_delta_norm.unsqueeze(0), a[1:4] / self.u_high[1:4]])
         control_cost = 0.01 * control_vec.norm()
         reward = 5.0 - 3.0 * pos_error  - 0.5*vel_error - 0.1*q_error - control_cost
+        reward = torch.nan_to_num(reward, nan=-100.0, posinf=100.0, neginf=-100.0).clamp(-200.0, 200.0)
 
         # Terminal conditions (scalar bool)
-        terminated = bool(pos.norm().item() > 15.0)
+        terminated = bool(pos.norm().item() > 15.0) or state_has_nonfinite
         truncated = self.step_count >= self.max_steps
 
         # Convert to numpy only at the gym boundary (info dict consumed externally)
-        pos_np = pos.cpu().numpy()
+        pos_np = np.nan_to_num(pos.detach().cpu().numpy(), nan=0.0, posinf=1e3, neginf=-1e3)
         info = {
             "position": pos_np.copy(),
-            "target_pos": target_pos.cpu().numpy().copy(),
-            "target_vel": target_vel.cpu().numpy().copy(),
-            "target_quat": target_quat.cpu().numpy().copy(),
-            "pos_error": pos_error.item(),
-            "vel_error": vel_error.item(),
-            "quat_error": q_error.item(),
-            "velocity": vel.cpu().numpy().copy(),
-            "quaternion": quat.cpu().numpy().copy(),
-            "action_raw": a.cpu().numpy().copy(),
-            "action_physical": u.cpu().numpy().copy(),
+            "target_pos": np.nan_to_num(target_pos.detach().cpu().numpy(), nan=0.0, posinf=1e3, neginf=-1e3).copy(),
+            "target_vel": np.nan_to_num(target_vel.detach().cpu().numpy(), nan=0.0, posinf=1e3, neginf=-1e3).copy(),
+            "target_quat": np.nan_to_num(target_quat.detach().cpu().numpy(), nan=0.0, posinf=1.0, neginf=-1.0).copy(),
+            "pos_error": float(torch.nan_to_num(pos_error, nan=1e3, posinf=1e3, neginf=1e3).item()),
+            "vel_error": float(torch.nan_to_num(vel_error, nan=1e3, posinf=1e3, neginf=1e3).item()),
+            "quat_error": float(torch.nan_to_num(q_error, nan=1.0, posinf=1.0, neginf=1.0).item()),
+            "velocity": np.nan_to_num(vel.detach().cpu().numpy(), nan=0.0, posinf=1e3, neginf=-1e3).copy(),
+            "quaternion": np.nan_to_num(quat.detach().cpu().numpy(), nan=0.0, posinf=1.0, neginf=-1.0).copy(),
+            "action_raw": np.nan_to_num(a.detach().cpu().numpy(), nan=0.0, posinf=0.0, neginf=0.0).copy(),
+            "action_physical": np.nan_to_num(u.detach().cpu().numpy(), nan=0.0, posinf=0.0, neginf=0.0).copy(),
             "hover_thrust": self.hover_thrust,
+            "numerical_issue": state_has_nonfinite,
         }
 
         if terminated:
-            info["done_reason"] = "terminated(out_of_bounds)"
+            info["done_reason"] = (
+                "terminated(numerical_issue)" if state_has_nonfinite else "terminated(out_of_bounds)"
+            )
         elif truncated:
             info["done_reason"] = "truncated(max_steps)"
         else:
             info["done_reason"] = "in_progress"
 
-        return self._get_obs(), reward.item(), terminated, truncated, info
+        return self._get_obs(), float(reward.item()), terminated, truncated, info
 
 
 def print_torch_runtime_info() -> None:
@@ -722,9 +748,14 @@ def main():
         env_kwargs={"device": env_device, "max_steps": max_episode_steps},
         vec_env_cls=vec_env_cls,
     )
+    env = VecCheckNan(env, raise_exception=False, warn_once=True)
     policy_class = policy_registry[policy_mode]
 
-    # Create PPO model
+    # Create PPO model.
+    # max_grad_norm=0.5 is already SB3's default, but we set it explicitly
+    # because Inf gradients (from near-zero std) interact badly with the clipping:
+    #   clip_coef = 0.5 / Inf = 0  →  grad * 0 = NaN.
+    # The real guard is log_std=-2 in MlpMpcPolicy; this is defense-in-depth.
     model = PPO(
         policy=policy_class,
         env=env,
@@ -735,6 +766,7 @@ def main():
         learning_rate=learning_rate,
         gamma=0.99,
         clip_range=0.2,
+        max_grad_norm=0.5,
         device=model_device,
     )
 
@@ -756,9 +788,29 @@ def main():
                 self.last_log = self.num_timesteps
             return True
 
+    # 每个 rollout 结束后强制 GC，回收 mpc.MPC autograd Function 产生的循环引用。
+    # 这些对象在 Python 引用计数下无法自动释放（因为 computation graph 存在环），
+    # 不显式 gc.collect() + empty_cache() 会导致 RAM/GPU 每 rollout 增长 ~600MB。
+    class GCCallback(BaseCallback):
+        """Force cycle GC + CUDA cache flush after every rollout to prevent memory leak."""
+
+        def __init__(self, rollout_size: int):
+            super().__init__()
+            self._rollout_size = max(1, rollout_size)
+            self._last_gc_step = 0
+
+        def _on_step(self) -> bool:
+            if self.num_timesteps - self._last_gc_step >= self._rollout_size:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self._last_gc_step = self.num_timesteps
+            return True
+
     resource_callback = ResourceLogCallback(log_interval=1000)
+    gc_callback = GCCallback(rollout_size=rollout_size)
     from stable_baselines3.common.callbacks import CallbackList
-    callbacks = CallbackList([episode_stats_callback, resource_callback])
+    callbacks = CallbackList([episode_stats_callback, resource_callback, gc_callback])
 
     model.learn(total_timesteps=total_timesteps, callback=callbacks)
     train_elapsed_seconds = time.perf_counter() - train_start_time
@@ -846,4 +898,5 @@ if __name__ == "__main__":
     except ImportError:
         print("[ERROR] 缺少nvidia-ml-py3库，请先运行: pip install nvidia-ml-py3 或 conda install -c conda-forge nvidia-ml-py3")
         sys.exit(1)
+
     main()

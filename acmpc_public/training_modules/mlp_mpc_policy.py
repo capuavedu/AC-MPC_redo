@@ -11,11 +11,12 @@ import il_env
 
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 
-from gym import spaces
+from gymnasium import spaces
 import torch as th
 from torch import nn
 
 from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.distributions import DiagGaussianDistribution
 
 
 class CustomNetwork(nn.Module):
@@ -114,7 +115,9 @@ class CustomNetwork(nn.Module):
             states = features
 
         states = states.to(self.device).float()
-        features_in = features[:, :self.features_in_dim]
+        states = th.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
+        features_in = features[:, :self.features_in_dim].to(self.device).float()
+        features_in = th.nan_to_num(features_in, nan=0.0, posinf=0.0, neginf=0.0)
         if (states.ndimension() == 1):
             states = th.unsqueeze(states, dim=0)
 
@@ -166,13 +169,27 @@ class CustomNetwork(nn.Module):
             p_w = (x_p[:, 10*self.T:13*self.T] - 0.5) * range_p
             p_t = x_p[:, 13*self.T:14*self.T] * range_p_t + epsilon
 
-            u_prev_chunk = self.u_prev[:, idx_start:idx_end]
+            # Only use u_prev warm-start during rollout (self.training=False).
+            # During training (evaluate_actions), samples are not chronologically ordered
+            # so u_prev from a different batch size would be invalid.
+            if (
+                not self.training
+                and self.u_prev is not None
+                and self.u_prev.shape[1] >= idx_end
+            ):
+                u_init_chunk = self.u_prev[:, idx_start:idx_end]
+            else:
+                u_init_chunk = None  # fall back to hover initialisation
 
             _Q = th.zeros(self.T, n_chunk, n_tau, n_tau, device=self.device)
             _p = th.zeros(self.T, n_chunk, n_tau, device=self.device)
 
 
-            states_chunk = states[idx_start:idx_end, :]
+            # states are environment observations (not learnable parameters);
+            # detaching prevents the MPC computation graph from extending backwards
+            # through the dynamics model, which has no trainable weights and would
+            # only inflate GPU memory without contributing any useful gradient.
+            states_chunk = states[idx_start:idx_end, :].detach()
 
             for i in range(self.T):
 
@@ -198,18 +215,38 @@ class CustomNetwork(nn.Module):
             # Run MPC
             nom_x_chunk, nom_u_chunk = self.mpc_env.mpc(
                 self.dx, states_chunk, _Q, _p,
-                # u_init=train_warmstart[idxs].transpose(0,1),
-                u_init=u_prev_chunk,
-                # eps_override=0.1,
+                u_init=u_init_chunk,
                 lqr_iter_override=1,
             )
+
+            # Replace non-finite MPC outputs with hover control to prevent NaN propagation.
+            hover_u = th.tensor(
+                [self.dx.mass * 9.806, 0.0, 0.0, 0.0],
+                device=self.device,
+                dtype=nom_u_chunk.dtype,
+            ).view(1, 1, 4).expand(self.T, n_chunk, -1)
+            ctrl_low = th.tensor(
+                [self.dx.thrust_min * 4, -self.dx.omega_max[0], -self.dx.omega_max[1], -self.dx.omega_max[2]],
+                device=self.device,
+                dtype=nom_u_chunk.dtype,
+            ).view(1, 1, 4)
+            ctrl_high = th.tensor(
+                [self.dx.thrust_max * 4, self.dx.omega_max[0], self.dx.omega_max[1], self.dx.omega_max[2]],
+                device=self.device,
+                dtype=nom_u_chunk.dtype,
+            ).view(1, 1, 4)
+            finite_mask = th.isfinite(nom_u_chunk)
+            nom_u_chunk = th.where(finite_mask, nom_u_chunk, hover_u)
+            nom_u_chunk = th.clamp(nom_u_chunk, min=ctrl_low, max=ctrl_high)
 
             nom_x[idx_start:idx_end, :, :] = nom_x_chunk.transpose(0,1)
             nom_u[idx_start:idx_end, :, :] = nom_u_chunk.transpose(0,1)
             idx_start = idx_end
 
 
-        self.u_prev = nom_u[:,0,:].transpose(0,1)
+        # Only update warm-start cache during rollout, not during training.
+        if not self.training:
+            self.u_prev = nom_u[:, 0, :].transpose(0, 1).detach()
 
         self.predictions = th.cat((nom_x, nom_u), dim=2).detach()
 
@@ -234,14 +271,18 @@ class CustomNetwork(nn.Module):
         omegas_normalized = th.div(omegas, omega_max).to(device=self.device)
 
         inputs_normalized = th.cat((thrust_normalized.unsqueeze(1), omegas_normalized), dim=1).to(self.device)
+        inputs_normalized = th.nan_to_num(inputs_normalized, nan=0.0, posinf=1.0, neginf=-1.0)
+        inputs_normalized = th.clamp(inputs_normalized, min=-2.0, max=2.0)
 
 
         return inputs_normalized
 
 
     def forward_critic(self, features: th.Tensor) -> th.Tensor:
-        features_in = features[:, :self.features_in_dim]
-        return self.value_net(features_in)
+        features_in = features[:, :self.features_in_dim].to(self.device).float()
+        features_in = th.nan_to_num(features_in, nan=0.0, posinf=0.0, neginf=0.0)
+        values = self.value_net(features_in)
+        return th.nan_to_num(values, nan=0.0, posinf=1e3, neginf=-1e3)
 
 
 class MlpMpcPolicy(ActorCriticPolicy):
@@ -262,8 +303,22 @@ class MlpMpcPolicy(ActorCriticPolicy):
             **kwargs,
         )
 
-        self.log_std.data.fill_(-100.0)
+        # log_std = -100 → exp(-100) = 0 on CUDA (FTZ flush-to-zero).
+        # Zero std → log_prob gradient = (a-μ)/σ² → Inf → clip_grad gives Inf*0 = NaN
+        # which permanently corrupts action_net weights.
+        # Use -2.0 (std ≈ 0.135): small enough to track MPC output, numerically safe.
+        self.log_std.data.fill_(-2.0)
         self.log_std.requires_grad = False
 
     def _build_mlp_extractor(self) -> None:
         self.mlp_extractor = CustomNetwork(self.features_dim)
+
+    def _get_action_dist_from_latent(self, latent_pi: th.Tensor):
+        # Guard latent_pi before action_net: prevents NaN from propagating into
+        # the Normal distribution even if weights were partially corrupted.
+        latent_pi = th.nan_to_num(latent_pi, nan=0.0, posinf=1.0, neginf=-1.0)
+        mean_actions = self.action_net(latent_pi)
+        mean_actions = th.nan_to_num(mean_actions, nan=0.0, posinf=1.0, neginf=-1.0)
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std)
+        return super()._get_action_dist_from_latent(latent_pi)

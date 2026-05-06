@@ -71,7 +71,7 @@ output/
 
 #### Run validation on trained model
 ```bash
-python val.py --model_dir output/ppo_mlp_04160745 --model_variant best --n_episodes 2
+python val.py --model_variant best --n_episodes 2 --model_dir output/ppo_mpc_04241231
 ```
 
 #### Validation output options

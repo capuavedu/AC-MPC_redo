@@ -1,12 +1,13 @@
 import sys
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 
-from gym import spaces
+from gymnasium import spaces
 import torch as th
 from torch import nn
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.distributions import DiagGaussianDistribution
 
 class CustomNetworkMlp(nn.Module):
     """
@@ -62,12 +63,16 @@ class CustomNetworkMlp(nn.Module):
     def forward_actor(self, features: th.Tensor) -> th.Tensor:
         # 与 MPC 版本不同：这里 actor 直接输出潜变量，不依赖环境状态的动力学结构
         features_in = features[:, :self.features_in_dim]
-        return self.policy_net(features_in)
+        features_in = th.nan_to_num(features_in, nan=0.0, posinf=0.0, neginf=0.0)
+        policy_latent = self.policy_net(features_in)
+        return th.nan_to_num(policy_latent, nan=0.0, posinf=1.0, neginf=-1.0)
 
 
     def forward_critic(self, features: th.Tensor) -> th.Tensor:
         features_in = features[:, :self.features_in_dim]
-        return self.value_net(features_in)
+        features_in = th.nan_to_num(features_in, nan=0.0, posinf=0.0, neginf=0.0)
+        values = self.value_net(features_in)
+        return th.nan_to_num(values, nan=0.0, posinf=1e3, neginf=-1e3)
 
 
 class MlpOnlyPolicy(ActorCriticPolicy):
@@ -92,4 +97,13 @@ class MlpOnlyPolicy(ActorCriticPolicy):
     def _build_mlp_extractor(self) -> None:
         # 注册自定义特征抽取后端：输出 actor/value 两路 latent
         self.mlp_extractor = CustomNetworkMlp(self.features_dim)
-        
+
+    def _get_action_dist_from_latent(self, latent_pi: th.Tensor):
+        # Guard against NaN/Inf in latent_pi (e.g. from gradient-corrupted weights).
+        latent_pi = th.nan_to_num(latent_pi, nan=0.0, posinf=1.0, neginf=-1.0)
+        mean_actions = self.action_net(latent_pi)
+        mean_actions = th.nan_to_num(mean_actions, nan=0.0, posinf=1.0, neginf=-1.0)
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std)
+        return super()._get_action_dist_from_latent(latent_pi)
+
